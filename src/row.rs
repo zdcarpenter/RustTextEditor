@@ -1,11 +1,17 @@
 use std::cmp;
+use crossterm::style::SetForegroundColor;
 use unicode_segmentation::UnicodeSegmentation;
+use crossterm::style::Color;
 
+use crate::SearchDirection;
+use crate::highlighting;
+use crate::HighlightingOptions;
 
 #[derive(Default)]
 pub struct Row {
     string: String,
     len: usize,
+    highlighting: Vec<highlighting::Type>,
 }
 
 impl From<&str> for Row {
@@ -13,6 +19,7 @@ impl From<&str> for Row {
         Self {
             string: String::from(slice),
             len: slice.graphemes(true).count(),
+            highlighting: Vec::new(),
         }
     }
 }
@@ -22,17 +29,28 @@ impl Row {
         let end = cmp::min(end, self.string.len());
         let start = cmp::min(start,end);
         let mut result = String::new();
-        for grapheme in self.string[..] 
+        let mut curr_highlighting = &highlighting::Type::None;
+        for (index, grapheme) in self.string[..] 
         .graphemes(true)
+        .enumerate()
         .skip(start)
         .take(end - start)
         {
-            if grapheme == "\t" {
-                result.push(' ')
-            } else {
-                result.push_str(grapheme)
+            if let Some(c) = grapheme.chars().next() {
+                let highlighting_type = self.highlighting.get(index).unwrap_or(&highlighting::Type::None);
+                if highlighting_type != curr_highlighting {
+                    curr_highlighting = highlighting_type;
+                    result.push_str(format!("{}", SetForegroundColor(highlighting_type.to_color())).as_str());
+                }
+                
+                if c == '\t' {
+                    result.push(' ')    
+                } else {
+                    result.push(c)
+                }
             }
         }
+        result.push_str(format!("{}", SetForegroundColor(Color::Reset)).as_str());
         result
     }
     pub fn len(&self) -> usize {
@@ -105,6 +123,7 @@ impl Row {
         Self {
             string: splitted_row,
             len: splitted_length,
+            highlighting: Vec::new(),
         }
     }
     
@@ -112,16 +131,140 @@ impl Row {
         self.string.as_bytes()
     }
     
-    pub fn find(&self, query: &str) -> Option<usize> {
-        let matching_byte_index = self.string.find(query);
+    pub fn find(&self, query: &str, at: usize, direction: SearchDirection) -> Option<usize> {
+        if at > self.len || query.is_empty() {
+            return None;
+        }
+        let start = if direction == SearchDirection::Forward {
+            at
+        } else {
+            0
+        };
+        let end  = if direction == SearchDirection::Forward {
+            self.len
+        } else {
+            at
+        };
+        let substring: String = self.string[..].graphemes(true).skip(start).take(end - start).collect();
+        let matching_byte_index = if direction == SearchDirection::Forward {
+            substring.find(query)
+        } else {
+            substring.rfind(query)
+        };
         if let Some(matching_byte_index) = matching_byte_index {
             for (grapheme_index, (byte_index,_)) in 
-            self.string[..].grapheme_indices(true).enumerate() {
+            substring[..].grapheme_indices(true).enumerate() {
                 if matching_byte_index == byte_index {
-                    return Some(grapheme_index)
+                    return Some(start + grapheme_index)
                 }
             } 
         }
         None
+    }
+    
+    pub fn highlight(&mut self,options: HighlightingOptions, word: Option<&str>) {
+        let mut highlighting = Vec::new();
+        let chars: Vec<char> = self.string.chars().collect();
+        let mut matches = Vec::new();
+        let mut search_index = 0;
+        if let Some(word) = word {
+            while let Some(search_match) = self.find(word, search_index, SearchDirection::Forward) {
+                matches.push(search_match);
+                if let Some(next_index) = search_match.checked_add(word[..].graphemes(true).count()) {
+                    search_index = next_index;
+                } else {
+                    break;
+                }
+            }
+        }
+        
+        let mut prev_is_separator = true;
+        let mut in_string = false;
+        let mut index = 0;
+        while let Some(c) = chars.get(index) {
+            if let Some(word) = word {
+                if matches.contains(&index) {
+                    for _ in word[..].graphemes(true) {
+                        index += 1;
+                        highlighting.push(highlighting::Type::Match);
+                    }
+                    continue;
+                }
+            }
+            let previous_highlight = if index > 0{
+                highlighting.get(index-1).unwrap_or(&highlighting::Type::None)
+            } else {
+                &highlighting::Type::None
+            };
+            if options.comments() && *c == '/' {
+                if let Some(next_char) = chars.get(index.saturating_add(1)) {
+                    if *next_char = '/' {
+                        for _ in index..chars.len() {
+                            highlighting.push(highlighting::Type::Comment);
+                        }
+                        break;
+                    }
+                };
+            }
+            if options.characters() {
+                prev_is_separator = true;
+                if let Some(next_char) = chars.get(index.saturating_add(1)) {
+                    let closing_index = if *next_char =='\\' {
+                        index.saturating_add(3)
+                    } else {
+                        index.saturating_add(2)
+                    };
+                    if let Some(closing_char) = chars.get(closing_index) {
+                        if *closing_char == '\'' {
+                            for _ in 0..=closing_index.saturating_sub(index) {
+                                highlighting.push(highlighting::Type::Character);
+                                index += 1;
+                            }
+                            continue;
+                        }
+                    }
+                };           
+                highlighting.push(highlighting::Type::None);
+                index += 1;
+                continue;
+            }
+            if options.strings() {
+                if in_string {
+                    highlighting.push(highlighting::Type::String);
+                    if *c == '\\' && index < self.len().saturating_sub(1) {
+                        highlighting.push(highlighting::Type::String);
+                        index += 2;
+                        continue;
+                    }
+                    if *c == '"' {
+                        in_string = false;
+                        prev_is_separator = true;
+                    } else {
+                        prev_is_separator = false;
+                    }
+                    index += 1;
+                    continue;
+                } else if prev_is_separator && *c == '"' {
+                    highlighting.push(highlighting::Type::String);
+                    in_string = true;
+                    prev_is_separator = true;
+                    index += 1;
+                    continue;
+                }
+            }
+            if options.numbers() {
+                if (c.is_ascii_digit() && (prev_is_separator || *previous_highlight == highlighting::Type::Number))
+                || (*c == '.' && *previous_highlight == highlighting::Type::Number) {
+                    highlighting.push(highlighting::Type::Number);
+                } else {
+                    highlighting.push(highlighting::Type::None);
+                }
+            } else {
+                highlighting.push(highlighting::Type::None);
+            }
+            prev_is_separator = c.is_ascii_punctuation() || c.is_ascii_whitespace();    
+            index += 1;
+        }
+        self.highlighting = highlighting;
     }
 }

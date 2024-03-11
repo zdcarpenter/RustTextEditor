@@ -2,8 +2,8 @@ use std::io::{stdout, Write};
 use crossterm::{
     cursor,
     terminal::{ClearType, self},
-    execute, QueueableCommand,
-    style::{Colors, SetColors, ResetColor},
+    execute,
+    style::{Colors, SetColors, ResetColor}, queue,
 };
 
 use crate::editor::Position;
@@ -52,8 +52,7 @@ impl Terminal {
         y = y.saturating_add(1);
         let x = x as u16;
         let y = y as u16;
-
-        stdout().queue(cursor::MoveTo(x - 1, y - 1)).ok();
+        queue!(stdout(),cursor::MoveTo(x - 1, y - 1)).ok();
     }
 
     pub fn cursor_hide() {
